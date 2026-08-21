@@ -240,7 +240,8 @@ do_list() {
 prune_backups() {
   local backup="$1" pat="$2"
   ls -1t "$backup/$pat".* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) \
-    | while read -r f; do rm -f "$f"; done
+    | while read -r f; do rm -f "$f"; done \
+    || true
 }
 
 do_switch() {
