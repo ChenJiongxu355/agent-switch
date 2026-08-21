@@ -319,6 +319,62 @@ do_switch() {
   echo "tip: reload the VSCode window for the Codex plugin to pick this up."
 }
 
+do_model() {
+  local want="${1:-}"
+  [ -f "$CONFIG" ] || die "no $CONFIG — run: codex-switch init"
+  grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
+    || die "$CONFIG has no [model_providers.$PKEY] block — run: codex-switch init"
+
+  local models fetch_rc
+  models="$(fetch_models)"; fetch_rc=$?
+
+  if [ -z "$want" ]; then
+    [ "$fetch_rc" = 0 ] || die "could not list models (see message above)"
+    local cm; cm="$(cur_model)"
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      if [ "$m" = "$cm" ]; then printf '* %s\n' "$m"; else printf '  %s\n' "$m"; fi
+    done <<< "$models"
+    return 0
+  fi
+
+  if [ "$fetch_rc" = 0 ] && [ -n "$models" ]; then
+    if ! grep -qxF "$want" <<< "$models"; then
+      note "error: model '$want' not found on $(cur_baseurl). available:"
+      printf '  %s\n' $models >&2
+      exit 1
+    fi
+  else
+    note "warning: could not verify models on $(cur_baseurl); setting '$want' anyway"
+  fi
+
+  local ts backup; ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$PROF_DIR/.last-backup"; mkdir -p "$backup"
+  cp -a "$CONFIG" "$backup/config.toml.$ts"
+
+  sed -i "s|^model = .*|model = \"$want\"|" "$CONFIG"
+
+  local prof; prof="$(current)"
+  case "$prof" in
+    \(*\)) note "note: current relay matches no profile; model not persisted to any profile meta" ;;
+    *)
+      if [ -f "$PROF_DIR/$prof/meta" ]; then
+        local tmp; tmp="$(mktemp)"
+        awk -F= -v m="$want" '/^model=/{print "model=" m; next} {print}' "$PROF_DIR/$prof/meta" > "$tmp"
+        grep -q '^model=' "$PROF_DIR/$prof/meta" || printf 'model=%s\n' "$want" >> "$tmp"
+        cat "$tmp" > "$PROF_DIR/$prof/meta"; rm -f "$tmp"
+      fi
+      ;;
+  esac
+
+  local db_note; db_note="$(rewrite_session_models "$want")"
+  prune_backups "$backup" "config.toml"
+
+  echo "model set to '$want'  (relay=$prof)"
+  [ -n "$db_note" ] && echo "$db_note"
+  echo "tip: reload the VSCode window for the Codex plugin to pick this up."
+}
+
 # ---- arg parsing: pull out --no-db anywhere ----
 args=()
 for a in "$@"; do
