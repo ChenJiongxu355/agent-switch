@@ -60,6 +60,11 @@ cur_baseurl() {
   ' "$CONFIG" 2>/dev/null || true
 }
 
+# top-level model currently set in config.toml
+cur_model() {
+  awk '/^model *=/{gsub(/^model *= *"?|"? *$/,"");print;exit}' "$CONFIG" 2>/dev/null || true
+}
+
 current() {
   [ -f "$CONFIG" ] || { echo "(no config)"; return; }
   local cb; cb="$(cur_baseurl)"
