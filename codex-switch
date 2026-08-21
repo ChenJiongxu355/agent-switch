@@ -28,6 +28,7 @@ PKEY="codex"                 # fixed provider key — do not change (see reason 
 DEFAULT_WIRE_API="responses" # current Codex requires the Responses API
 KEEP_BACKUPS=5
 REWRITE_DB=1                 # rewrite threads.model on switch (see reason #3); --no-db disables
+CX_MODELS_STUB="${CX_MODELS_STUB:-}"  # test-only: if set, fetch_models echoes this instead of calling curl
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "$*" >&2; }
