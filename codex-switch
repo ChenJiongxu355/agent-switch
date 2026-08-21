@@ -65,6 +65,36 @@ cur_model() {
   awk '/^model *=/{gsub(/^model *= *"?|"? *$/,"");print;exit}' "$CONFIG" 2>/dev/null || true
 }
 
+# echo newline-separated model IDs from the current relay's /models.
+# returns non-zero on fetch failure. honors CX_MODELS_STUB (test-only).
+fetch_models() {
+  if [ -n "$CX_MODELS_STUB" ]; then printf '%s\n' "$CX_MODELS_STUB"; return 0; fi
+  command -v curl >/dev/null 2>&1 || { note "the 'model' command requires curl"; return 1; }
+  local base key body http
+  base="$(cur_baseurl)"; [ -n "$base" ] || { note "no base_url in $CONFIG"; return 1; }
+  key="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["OPENAI_API_KEY"])' "$AUTH" 2>/dev/null)"
+  if [ -z "$key" ]; then
+    key="$(grep -oE '"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"[^"]*"' "$AUTH" 2>/dev/null | sed -E 's/.*"([^"]*)"$/\1/')"
+  fi
+  [ -n "$key" ] || { note "no API key in $AUTH"; return 1; }
+  body="$(curl -sS -m20 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null)"
+  http=$?
+  [ "$http" = 0 ] && [ -n "$body" ] || { note "fetch failed from $base/models"; return 1; }
+  local ids
+  if command -v python3 >/dev/null 2>&1; then
+    ids="$(printf '%s' "$body" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(3)
+print("\n".join(str(x.get("id","")) for x in d.get("data",[]) if x.get("id")))' 2>/dev/null)"
+  fi
+  if [ -z "$ids" ]; then
+    ids="$(printf '%s' "$body" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')"
+  fi
+  [ -n "$ids" ] || { note "could not parse models from $base (body head: $(printf '%s' "$body" | head -c 120))"; return 2; }
+  printf '%s\n' "$ids"
+}
+
 current() {
   [ -f "$CONFIG" ] || { echo "(no config)"; return; }
   local cb; cb="$(cur_baseurl)"
