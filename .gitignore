@@ -1,0 +1,18 @@
+# NEVER commit relay profiles — they contain API keys in auth.json.
+cc-profiles/
+
+# backups produced at runtime
+*.bak
+*.bak.*
+.last-backup/
+.migrate-backup*/
+
+# local state / secrets
+auth.json
+config.toml
+*.sqlite
+*.sqlite-*
+
+# editor / OS noise
+*.swp
+.DS_Store

@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# codex-switch — switch OpenAI Codex CLI/IDE between multiple API relays (中转站).
+#
+# Why this exists (three non-obvious problems it solves):
+#   1. env_key trap: giving every provider the same `env_key = "OPENAI_API_KEY"`
+#      makes Codex ignore auth.json and read only the env var, so switching breaks.
+#      Fix: provider block has NO env_key; the key travels in auth.json.
+#   2. Plugin filters sessions by provider: the VSCode Codex plugin lists sessions
+#      filtered by the current model_provider. Fix: all relays share ONE fixed
+#      provider key ("codex"), so the session list stays visible across relays.
+#   3. Sessions store their model: state_*.sqlite's threads.model pins the model
+#      per session; resuming an old session on a relay that lacks that model → 503.
+#      Fix: on switch, rewrite threads.model to the target relay's model.
+#
+# It only touches: config.toml (top model + [model_providers.codex] base_url),
+# auth.json, and threads.model in the state DB. It never touches session bodies,
+# memories, or Claude Code.
+#
+# License: MIT. This is a community tool that depends on Codex's internal state
+# DB schema; a future Codex upgrade may require adapting it.
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+PROF_DIR="$CODEX_HOME/cc-profiles"
+CONFIG="$CODEX_HOME/config.toml"
+AUTH="$CODEX_HOME/auth.json"
+PKEY="codex"                 # fixed provider key — do not change (see reason #2)
+DEFAULT_WIRE_API="responses" # current Codex requires the Responses API
+KEEP_BACKUPS=5
+REWRITE_DB=1                 # rewrite threads.model on switch (see reason #3); --no-db disables
+
+die() { echo "error: $*" >&2; exit 1; }
+note() { echo "$*" >&2; }
+
+# Newest state DB (the numeric suffix is a schema version, e.g. state_5.sqlite,
+# and changes across Codex upgrades — never hardcode it).
+find_state_db() {
+  ls -1t "$CODEX_HOME"/state_*.sqlite 2>/dev/null | head -1
+}
+
+list_profiles() {
+  [ -d "$PROF_DIR" ] || return 0
+  for d in "$PROF_DIR"/*/; do
+    [ -d "$d" ] || continue
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac    # skip hidden dirs (backups etc.)
+    echo "$b"
+  done
+}
+
+meta_get() { awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,"");print;exit}' "$2" 2>/dev/null; }
+
+# base_url currently set inside the [model_providers.codex] block
+cur_baseurl() {
+  awk '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1;next}
+    /^\[/{inblk=0}
+    inblk && /^base_url/{gsub(/^base_url *= *"?|"? *$/,"");print;exit}
+  ' "$CONFIG" 2>/dev/null || true
+}
+
+current() {
+  [ -f "$CONFIG" ] || { echo "(no config)"; return; }
+  local cb; cb="$(cur_baseurl)"
+  for p in $(list_profiles); do
+    [ "$(meta_get base_url "$PROF_DIR/$p/meta")" = "$cb" ] && { echo "$p"; return; }
+  done
+  echo "(unknown: ${cb:-none})"
+}
+
+usage() {
+  cat <<EOF
+codex-switch — switch Codex CLI/IDE between API relays
+
+Usage: codex-switch [command|profile]
+
+Commands:
+  init                 set up config.toml with the single [model_providers.$PKEY] block
+  add <name>           add a relay profile (prompts for base_url / model / API key)
+  rm <name>            remove a relay profile
+  <name>               switch to a relay profile
+  list, ls             list profiles (marks current)
+  current, cur         show current relay
+  help                 show this help
+
+Options (for switch):
+  --no-db              do not rewrite session models in the state DB
+
+After switching, reload the VSCode window (Developer: Reload Window) for the
+Codex plugin to pick up the change. All relays share provider key "$PKEY", so
+session lists stay visible across relays.
+EOF
+}
+
+# --- write a valid JSON auth.json (python3 if available, else printf fallback) ---
+write_auth() {
+  local path="$1" key="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    KEY_VALUE="$key" python3 - "$path" <<'PY'
+import json, os, sys
+json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": os.environ["KEY_VALUE"]},
+          open(sys.argv[1], "w"), indent=2)
+PY
+  else
+    # Fallback: keys here are OpenAI-style tokens (no quotes/backslashes), safe to inline.
+    printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "%s"\n}\n' "$key" > "$path"
+  fi
+  chmod 600 "$path"
+}
+
+auth_key_ok() {
+  # true if auth.json parses and key is non-empty and not a placeholder
+  local path="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$path" <<'PY' 2>/dev/null
+import json, sys
+try:
+    k = str(json.load(open(sys.argv[1])).get("OPENAI_API_KEY", ""))
+except Exception:
+    sys.exit(1)
+sys.exit(1 if (not k or "PUT_YOUR" in k) else 0)
+PY
+  else
+    grep -q '"OPENAI_API_KEY"' "$path" 2>/dev/null && ! grep -q 'PUT_YOUR' "$path" 2>/dev/null
+  fi
+}
+
+do_init() {
+  mkdir -p "$PROF_DIR"
+  if [ ! -f "$CONFIG" ]; then
+    cat > "$CONFIG" <<EOF
+model = "gpt-5-codex"
+model_provider = "$PKEY"
+model_reasoning_effort = "high"
+
+[model_providers.$PKEY]
+name = "$PKEY"
+base_url = "https://api.openai.com/v1"
+wire_api = "$DEFAULT_WIRE_API"
+EOF
+    note "created $CONFIG with the single [model_providers.$PKEY] block"
+  elif ! grep -q "^\[model_providers\.$PKEY\]" "$CONFIG"; then
+    cp -a "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+    cat >> "$CONFIG" <<EOF
+
+[model_providers.$PKEY]
+name = "$PKEY"
+base_url = "https://api.openai.com/v1"
+wire_api = "$DEFAULT_WIRE_API"
+EOF
+    note "appended [model_providers.$PKEY] block to $CONFIG (backup saved)"
+    note "note: set top-level model_provider = \"$PKEY\" in $CONFIG if not already"
+  else
+    note "config already has [model_providers.$PKEY]; nothing to do"
+  fi
+  note "next: codex-switch add <name>"
+}
+
+do_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: codex-switch add <name>"
+  case "$name" in .*|*/*) die "invalid profile name: $name";; esac
+  local dir="$PROF_DIR/$name"
+  mkdir -p "$dir"
+
+  local base_url model wire_api key
+  printf 'base_url (e.g. https://relay.example.com/v1): ' >&2; read -r base_url
+  [ -n "$base_url" ] || die "base_url is required"
+  printf 'model name (e.g. gpt-5-codex): ' >&2; read -r model
+  [ -n "$model" ] || die "model is required"
+  printf 'wire_api [%s]: ' "$DEFAULT_WIRE_API" >&2; read -r wire_api
+  wire_api="${wire_api:-$DEFAULT_WIRE_API}"
+  printf 'API key (input hidden): ' >&2; read -rs key; printf '\n' >&2
+  [ -n "$key" ] || die "API key is required"
+
+  printf 'model=%s\nbase_url=%s\nwire_api=%s\n' "$model" "$base_url" "$wire_api" > "$dir/meta"
+  write_auth "$dir/auth.json" "$key"
+  key=""
+  note "added profile '$name' (model=$model, wire_api=$wire_api)"
+  note "switch to it with: codex-switch $name"
+}
+
+do_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: codex-switch rm <name>"
+  local dir="$PROF_DIR/$name"
+  [ -d "$dir" ] || die "no such profile: $name"
+  rm -rf "$dir"
+  note "removed profile '$name'"
+}
+
+do_list() {
+  local cur; cur="$(current)"
+  local any=0
+  for p in $(list_profiles); do
+    any=1
+    local m; m="$(meta_get model "$PROF_DIR/$p/meta")"
+    if [ "$p" = "$cur" ]; then printf '* %-10s (current)  model=%s\n' "$p" "$m"
+    else printf '  %-10s           model=%s\n' "$p" "$m"; fi
+  done
+  [ "$any" = 1 ] || note "no profiles yet — add one with: codex-switch add <name>"
+}
+
+prune_backups() {
+  local backup="$1" pat="$2"
+  ls -1t "$backup/$pat".* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) \
+    | while read -r f; do rm -f "$f"; done
+}
+
+do_switch() {
+  local name="$1"
+  local src="$PROF_DIR/$name"
+  [ -f "$CONFIG" ] || die "no $CONFIG — run: codex-switch init"
+  [ -d "$src" ] || die "unknown profile '$name'. available: $(list_profiles | paste -sd', ' -)"
+  [ -f "$src/meta" ] || die "$src/meta missing"
+  [ -f "$src/auth.json" ] || die "$src/auth.json missing"
+
+  local model base_url wire_api
+  model="$(meta_get model "$src/meta")"
+  base_url="$(meta_get base_url "$src/meta")"
+  wire_api="$(meta_get wire_api "$src/meta")"; wire_api="${wire_api:-$DEFAULT_WIRE_API}"
+  [ -n "$model" ] && [ -n "$base_url" ] || die "$src/meta incomplete (need model= and base_url=)"
+
+  grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
+    || die "$CONFIG has no [model_providers.$PKEY] block — run: codex-switch init"
+  auth_key_ok "$src/auth.json" \
+    || die "profile '$name' has a placeholder/invalid API key — re-run: codex-switch add $name"
+
+  # backup current state
+  local ts backup; ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$PROF_DIR/.last-backup"; mkdir -p "$backup"
+  cp -a "$CONFIG" "$backup/config.toml.$ts"
+  [ -f "$AUTH" ] && cp -a "$AUTH" "$backup/auth.json.$ts"
+
+  # atomic replace auth.json
+  install -m 600 "$src/auth.json" "$AUTH.tmp.$$"
+  mv -f "$AUTH.tmp.$$" "$AUTH"
+
+  # top-level model
+  sed -i "s|^model = .*|model = \"$model\"|" "$CONFIG"
+
+  # base_url + wire_api inside the [model_providers.codex] block only
+  local tmp; tmp="$(mktemp)"
+  awk -v url="$base_url" -v wire="$wire_api" '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1; print; next}
+    /^\[/{inblk=0}
+    inblk && /^base_url/{print "base_url = \"" url "\""; next}
+    inblk && /^wire_api/{print "wire_api = \"" wire "\""; next}
+    {print}
+  ' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"; rm -f "$tmp"
+
+  # rewrite session models so the plugin can resume old sessions on this relay
+  local db_note="" STATE_DB
+  STATE_DB="$(find_state_db)"
+  if [ "$REWRITE_DB" = 1 ] && [ -n "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    cp -a "$STATE_DB" "$backup/$(basename "$STATE_DB").$ts" 2>/dev/null || true
+    if sqlite3 "$STATE_DB" \
+        "PRAGMA busy_timeout=10000; UPDATE threads SET model='$model' WHERE model IS NOT NULL AND model<>'$model';" \
+        >/dev/null 2>&1; then
+      local n; n="$(sqlite3 "$STATE_DB" "SELECT count(*) FROM threads WHERE model='$model';" 2>/dev/null)"
+      db_note="  unified session model to $model (${n:-?} sessions)"
+    else
+      db_note="  warning: could not update session models (state DB busy); old sessions may error on resume"
+    fi
+    prune_backups "$backup" "$(basename "$STATE_DB")"
+  fi
+
+  prune_backups "$backup" "config.toml"
+  prune_backups "$backup" "auth.json"
+
+  echo "switched to '$name'  (model=$model)"
+  echo "  base_url=$base_url  wire_api=$wire_api  provider=$PKEY"
+  [ -n "$db_note" ] && echo "$db_note"
+  echo "tip: reload the VSCode window for the Codex plugin to pick this up."
+}
+
+# ---- arg parsing: pull out --no-db anywhere ----
+args=()
+for a in "$@"; do
+  case "$a" in
+    --no-db) REWRITE_DB=0 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+cmd="${1:-list}"
+case "$cmd" in
+  init)          do_init ;;
+  add)           do_add "${2:-}" ;;
+  rm|remove)     do_rm "${2:-}" ;;
+  list|ls)       do_list ;;
+  current|cur)   echo "current: $(current)" ;;
+  help|-h|--help) usage ;;
+  *)             do_switch "$cmd" ;;
+esac
