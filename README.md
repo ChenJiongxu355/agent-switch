@@ -85,6 +85,8 @@ codex-switch add dmx
 codex-switch list              # list profiles, mark current
 codex-switch dmx               # switch to relay 'dmx'
 codex-switch current           # show current relay
+codex-switch model             # list models the current relay offers
+codex-switch model gpt-5-codex # switch active model (validated against the relay)
 codex-switch rm dmx            # remove a profile
 ```
 
@@ -97,6 +99,17 @@ codex-switch rm dmx            # remove a profile
 ### Switch options
 
 - `--no-db` — do not rewrite session models in the state DB (keep each session's stored model).
+
+### Switching models on a relay
+
+`codex-switch model` lists the models the **current relay** actually serves (live
+`/v1/models` fetch), marking the active one with `*`. `codex-switch model <name>`
+validates `<name>` against that list (refusing, with the available list, if it's
+not there — so you can't accidentally pin a model the relay lacks), then updates
+the top-level `model` in `config.toml`, writes the choice back to the current
+profile's `meta`, and rewrites session models in the state DB (skip with `--no-db`).
+
+Requires `curl`. Reload the VSCode window afterward.
 
 ### After switching in VSCode
 
@@ -156,6 +169,13 @@ session-model rewrite was skipped. Reload the window and switch again, or use
 **Is it safe to commit my profiles?**
 No — `cc-profiles/` holds API keys. The included `.gitignore` excludes it. This repo
 is pure logic; every user builds their own profiles with `add`.
+
+**The plugin shows my model as "Custom" and I can't pick relay models from its menu.**
+The plugin's model menu only lists its built-in whitelist of official names. Relays
+often use their own names (suffixes like `-cdx`, `-high`), which aren't on that
+whitelist, so the plugin labels them "Custom" — this is cosmetic and doesn't affect
+function. To see and switch among the names a relay actually accepts, use
+`codex-switch model` / `codex-switch model <name>` instead of the plugin menu.
 
 **The VSCode plugin gives `401 Unauthorized: 未提供令牌 / Invalid token` on a relay, but the CLI works fine on the same relay.**
 This is almost certainly **not** a codex-switch problem — it's the codex binary
