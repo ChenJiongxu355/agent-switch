@@ -65,6 +65,13 @@ cur_model() {
   awk '/^model *=/{gsub(/^model *= *"?|"? *$/,"");print;exit}' "$CONFIG" 2>/dev/null || true
 }
 
+# safely set the top-level model line in config.toml (avoids sed/awk metachar injection)
+set_config_model() {
+  local tmp; tmp="$(mktemp)"
+  CX_SET_MODEL="$1" awk '/^model *=/{print "model = \"" ENVIRON["CX_SET_MODEL"] "\""; next} {print}' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"; rm -f "$tmp"
+}
+
 # echo newline-separated model IDs from the current relay's /models.
 # returns non-zero on fetch failure. honors CX_MODELS_STUB (test-only).
 fetch_models() {
@@ -249,14 +256,15 @@ prune_backups() {
 # rewrite threads.model in the newest state DB to $1. echoes a human note.
 # respects REWRITE_DB and $backup/$ts from the caller's scope.
 rewrite_session_models() {
-  local model="$1" STATE_DB db_note=""
+  local model="$1" esc STATE_DB db_note=""
+  esc="${model//\'/\'\'}"
   STATE_DB="$(find_state_db)"
   if [ "$REWRITE_DB" = 1 ] && [ -n "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
     cp -a "$STATE_DB" "$backup/$(basename "$STATE_DB").$ts" 2>/dev/null || true
     if sqlite3 "$STATE_DB" \
-        "PRAGMA busy_timeout=10000; UPDATE threads SET model='$model' WHERE model IS NOT NULL AND model<>'$model';" \
+        "PRAGMA busy_timeout=10000; UPDATE threads SET model='$esc' WHERE model IS NOT NULL AND model<>'$esc';" \
         >/dev/null 2>&1; then
-      local n; n="$(sqlite3 "$STATE_DB" "SELECT count(*) FROM threads WHERE model='$model';" 2>/dev/null)"
+      local n; n="$(sqlite3 "$STATE_DB" "SELECT count(*) FROM threads WHERE model='$esc';" 2>/dev/null)"
       db_note="  unified session model to $model (${n:-?} sessions)"
     else
       db_note="  warning: could not update session models (state DB busy); old sessions may error on resume"
@@ -296,7 +304,7 @@ do_switch() {
   mv -f "$AUTH.tmp.$$" "$AUTH"
 
   # top-level model
-  sed -i "s|^model = .*|model = \"$model\"|" "$CONFIG"
+  set_config_model "$model"
 
   # base_url + wire_api inside the [model_providers.codex] block only
   local tmp; tmp="$(mktemp)"
@@ -343,7 +351,7 @@ do_model() {
   if [ "$fetch_rc" = 0 ] && [ -n "$models" ]; then
     if ! grep -qxF "$want" <<< "$models"; then
       note "error: model '$want' not found on $(cur_baseurl). available:"
-      printf '  %s\n' $models >&2
+      while IFS= read -r m; do [ -n "$m" ] && printf '  %s\n' "$m" >&2; done <<< "$models"
       exit 1
     fi
   else
@@ -354,20 +362,17 @@ do_model() {
   backup="$PROF_DIR/.last-backup"; mkdir -p "$backup"
   cp -a "$CONFIG" "$backup/config.toml.$ts"
 
-  sed -i "s|^model = .*|model = \"$want\"|" "$CONFIG"
+  set_config_model "$want"
 
   local prof; prof="$(current)"
-  case "$prof" in
-    \(*\)) note "note: current relay matches no profile; model not persisted to any profile meta" ;;
-    *)
-      if [ -f "$PROF_DIR/$prof/meta" ]; then
-        local tmp; tmp="$(mktemp)"
-        awk -F= -v m="$want" '/^model=/{print "model=" m; next} {print}' "$PROF_DIR/$prof/meta" > "$tmp"
-        grep -q '^model=' "$PROF_DIR/$prof/meta" || printf 'model=%s\n' "$want" >> "$tmp"
-        cat "$tmp" > "$PROF_DIR/$prof/meta"; rm -f "$tmp"
-      fi
-      ;;
-  esac
+  if [ -d "$PROF_DIR/$prof" ] && [ -f "$PROF_DIR/$prof/meta" ]; then
+    local tmp; tmp="$(mktemp)"
+    CX_SET_MODEL="$want" awk -F= '/^model=/{print "model=" ENVIRON["CX_SET_MODEL"]; next} {print}' "$PROF_DIR/$prof/meta" > "$tmp"
+    grep -q '^model=' "$PROF_DIR/$prof/meta" || printf 'model=%s\n' "$want" >> "$tmp"
+    cat "$tmp" > "$PROF_DIR/$prof/meta"; rm -f "$tmp"
+  else
+    note "note: current relay matches no profile; model not persisted to any profile meta"
+  fi
 
   local db_note; db_note="$(rewrite_session_models "$want")"
   prune_backups "$backup" "config.toml"

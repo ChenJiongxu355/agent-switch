@@ -51,4 +51,15 @@ unset CX_MODELS_STUB
 grep -q '^model = "gpt-z"' "$T/config.toml" && pass "unavailable list proceeds" || fail "unavailable list proceeds"
 teardown
 
+# 6. injection-safe: special chars in model name must not damage db or config
+setup
+mal="e'&|d"
+export CX_MODELS_STUB=$'gpt-a\ngpt-b\n'"$mal"
+"$SW" model "$mal" >/dev/null 2>&1
+n="$(sqlite3 "$T/state_5.sqlite" "SELECT count(*) FROM threads;" 2>/dev/null)"
+[ "$n" = 2 ] && pass "injection: threads table intact" || fail "injection: threads table intact (got '$n')"
+[ "$(grep -c '^model = ' "$T/config.toml")" = 1 ] && pass "injection: config has one model line" || fail "injection: config model line"
+[ "$(sqlite3 "$T/state_5.sqlite" "SELECT DISTINCT model FROM threads;" 2>/dev/null)" = "$mal" ] && pass "injection: model set literally" || fail "injection: model set literally"
+teardown
+
 [ "$FAIL" = 0 ] && echo "ALL TESTS PASSED" || { echo "SOME TESTS FAILED"; exit 1; }
