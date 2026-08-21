@@ -115,6 +115,8 @@ Commands:
   add <name>           add a relay profile (prompts for base_url / model / API key)
   rm <name>            remove a relay profile
   <name>               switch to a relay profile
+  model                list models on the current relay (marks current)
+  model <name>         switch active model on the current relay
   list, ls             list profiles (marks current)
   current, cur         show current relay
   help                 show this help
@@ -390,6 +392,7 @@ case "$cmd" in
   init)          do_init ;;
   add)           do_add "${2:-}" ;;
   rm|remove)     do_rm "${2:-}" ;;
+  model)         do_model "${2:-}" ;;
   list|ls)       do_list ;;
   current|cur)   echo "current: $(current)" ;;
   help|-h|--help) usage ;;
