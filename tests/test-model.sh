@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# tests for the `model` command. uses a temp CODEX_HOME + CX_MODELS_STUB (no network).
+set -uo pipefail
+SW="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/codex-switch"
+FAIL=0
+pass() { echo "PASS: $1"; }
+fail() { echo "FAIL: $1"; FAIL=1; }
+
+setup() {
+  T="$(mktemp -d)"; export CODEX_HOME="$T"
+  "$SW" init >/dev/null
+  printf 'https://[IP]:9/v1\ngpt-a\n\nsk-fakeAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n' | "$SW" add p1 >/dev/null
+  "$SW" p1 >/dev/null 2>&1
+  sqlite3 "$T/state_5.sqlite" "CREATE TABLE threads(id INTEGER PRIMARY KEY, model TEXT); INSERT INTO threads(model) VALUES('old'),('old');"
+}
+teardown() { unset CODEX_HOME CX_MODELS_STUB; rm -rf "$T"; }
+
+# 1. list marks current
+setup
+export CX_MODELS_STUB=$'gpt-a\ngpt-b\ngpt-c'
+out="$("$SW" model)"
+echo "$out" | grep -q '^\* gpt-a' && echo "$out" | grep -q '^  gpt-b' && pass "list marks current" || fail "list marks current"
+
+# 2. valid switch updates config + meta + db
+"$SW" model gpt-b >/dev/null
+grep -q '^model = "gpt-b"' "$T/config.toml" && pass "switch updates config" || fail "switch updates config"
+grep -q '^model=gpt-b' "$T/cc-profiles/p1/meta" && pass "switch persists meta" || fail "switch persists meta"
+[ "$(sqlite3 "$T/state_5.sqlite" "SELECT DISTINCT model FROM threads;")" = "gpt-b" ] && pass "switch rewrites db" || fail "switch rewrites db"
+teardown
+
+# 3. invalid model refused, config unchanged
+setup
+export CX_MODELS_STUB=$'gpt-a\ngpt-b'
+before="$(grep '^model = ' "$T/config.toml")"
+"$SW" model nope 2>/dev/null; rc=$?
+[ "$rc" != 0 ] && pass "invalid model exits nonzero" || fail "invalid model exits nonzero"
+[ "$(grep '^model = ' "$T/config.toml")" = "$before" ] && pass "invalid model leaves config" || fail "invalid model leaves config"
+teardown
+
+# 4. --no-db skips db rewrite
+setup
+export CX_MODELS_STUB=$'gpt-a\ngpt-b'
+"$SW" model gpt-b --no-db >/dev/null
+[ "$(sqlite3 "$T/state_5.sqlite" "SELECT DISTINCT model FROM threads;")" = "old" ] && pass "--no-db skips db" || fail "--no-db skips db"
+teardown
+
+# 5. unavailable list -> warn + proceed (stub unset => curl to [IP]:9 fails fast)
+setup
+unset CX_MODELS_STUB
+"$SW" model gpt-z 2>/dev/null
+grep -q '^model = "gpt-z"' "$T/config.toml" && pass "unavailable list proceeds" || fail "unavailable list proceeds"
+teardown
+
+[ "$FAIL" = 0 ] && echo "ALL TESTS PASSED" || { echo "SOME TESTS FAILED"; exit 1; }
