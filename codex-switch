@@ -327,8 +327,8 @@ do_model() {
   grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
     || die "$CONFIG has no [model_providers.$PKEY] block — run: codex-switch init"
 
-  local models fetch_rc
-  models="$(fetch_models)"; fetch_rc=$?
+  local models fetch_rc=0
+  models="$(fetch_models)" || fetch_rc=$?
 
   if [ -z "$want" ]; then
     [ "$fetch_rc" = 0 ] || die "could not list models (see message above)"
