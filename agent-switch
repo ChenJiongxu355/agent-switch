@@ -1,0 +1,718 @@
+#!/usr/bin/env bash
+# agent-switch — switch Codex and Claude Code between API relays (中转站).
+#
+# Why this exists (three non-obvious problems it solves):
+#   1. env_key trap: giving every provider the same `env_key = "OPENAI_API_KEY"`
+#      makes Codex ignore auth.json and read only the env var, so switching breaks.
+#      Fix: provider block has NO env_key; the key travels in auth.json.
+#   2. Plugin filters sessions by provider: the VSCode Codex plugin lists sessions
+#      filtered by the current model_provider. Fix: all relays share ONE fixed
+#      provider key ("codex"), so the session list stays visible across relays.
+#   3. Sessions store their model: state_*.sqlite's threads.model pins the model
+#      per session; resuming an old session on a relay that lacks that model → 503.
+#      Fix: on switch, rewrite threads.model to the target relay's model.
+#
+# The Codex backend touches: config.toml (top model + [model_providers.codex] base_url),
+# auth.json, and threads.model in the state DB. It never touches session bodies,
+# memories, or Claude Code. Claude Code uses the separate `cc` namespace below.
+#
+# License: MIT. This is a community tool that depends on Codex's internal state
+# DB schema; a future Codex upgrade may require adapting it.
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+PROF_DIR="$CODEX_HOME/cc-profiles"
+CONFIG="$CODEX_HOME/config.toml"
+AUTH="$CODEX_HOME/auth.json"
+PKEY="codex"                 # fixed provider key — do not change (see reason #2)
+DEFAULT_WIRE_API="responses" # current Codex requires the Responses API
+KEEP_BACKUPS=5
+REWRITE_DB=1                 # rewrite threads.model on switch (see reason #3); --no-db disables
+CX_MODELS_STUB="${CX_MODELS_STUB:-}"  # test-only: if set, fetch_models echoes this instead of calling curl
+
+# Claude Code settings are shared by its CLI and VS Code extension.
+CLAUDE_HOME="${CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+CC_PROF_DIR="$CLAUDE_HOME/provider-profiles"
+CC_SETTINGS="$CLAUDE_HOME/settings.json"
+CC_ACTIVE="$CC_PROF_DIR/.active"
+CC_MANAGED="$CC_PROF_DIR/.managed-keys"
+CC_BACKUP="$CC_PROF_DIR/.backup"
+
+die() { echo "error: $*" >&2; exit 1; }
+note() { echo "$*" >&2; }
+
+# Newest state DB (the numeric suffix is a schema version, e.g. state_5.sqlite,
+# and changes across Codex upgrades — never hardcode it).
+find_state_db() {
+  ls -1t "$CODEX_HOME"/state_*.sqlite 2>/dev/null | head -1
+}
+
+list_profiles() {
+  [ -d "$PROF_DIR" ] || return 0
+  for d in "$PROF_DIR"/*/; do
+    [ -d "$d" ] || continue
+    b="$(basename "$d")"
+    case "$b" in .*) continue;; esac    # skip hidden dirs (backups etc.)
+    echo "$b"
+  done
+}
+
+meta_get() { awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,"");print;exit}' "$2" 2>/dev/null; }
+
+# base_url currently set inside the [model_providers.codex] block
+cur_baseurl() {
+  awk '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1;next}
+    /^\[/{inblk=0}
+    inblk && /^base_url/{gsub(/^base_url *= *"?|"? *$/,"");print;exit}
+  ' "$CONFIG" 2>/dev/null || true
+}
+
+# top-level model currently set in config.toml
+cur_model() {
+  awk '/^model *=/{gsub(/^model *= *"?|"? *$/,"");print;exit}' "$CONFIG" 2>/dev/null || true
+}
+
+# safely set the top-level model line in config.toml (avoids sed/awk metachar injection)
+set_config_model() {
+  local tmp; tmp="$(mktemp)"
+  CX_SET_MODEL="$1" awk '/^model *=/{print "model = \"" ENVIRON["CX_SET_MODEL"] "\""; next} {print}' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"; rm -f "$tmp"
+}
+
+# echo newline-separated model IDs from the current relay's /models.
+# returns non-zero on fetch failure. honors CX_MODELS_STUB (test-only).
+fetch_models() {
+  if [ -n "$CX_MODELS_STUB" ]; then printf '%s\n' "$CX_MODELS_STUB"; return 0; fi
+  command -v curl >/dev/null 2>&1 || { note "the 'model' command requires curl"; return 1; }
+  local base key body http
+  base="$(cur_baseurl)"; [ -n "$base" ] || { note "no base_url in $CONFIG"; return 1; }
+  key="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["OPENAI_API_KEY"])' "$AUTH" 2>/dev/null)"
+  if [ -z "$key" ]; then
+    key="$(grep -oE '"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"[^"]*"' "$AUTH" 2>/dev/null | sed -E 's/.*"([^"]*)"$/\1/')"
+  fi
+  [ -n "$key" ] || { note "no API key in $AUTH"; return 1; }
+  body="$(curl -sS -m20 -H "Authorization: Bearer $key" "$base/models" 2>/dev/null)"
+  http=$?
+  [ "$http" = 0 ] && [ -n "$body" ] || { note "fetch failed from $base/models"; return 1; }
+  local ids
+  if command -v python3 >/dev/null 2>&1; then
+    ids="$(printf '%s' "$body" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(3)
+print("\n".join(str(x.get("id","")) for x in d.get("data",[]) if x.get("id")))' 2>/dev/null)"
+  fi
+  if [ -z "$ids" ]; then
+    ids="$(printf '%s' "$body" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')"
+  fi
+  [ -n "$ids" ] || { note "could not parse models from $base (body head: $(printf '%s' "$body" | head -c 120))"; return 2; }
+  printf '%s\n' "$ids"
+}
+
+current() {
+  [ -f "$CONFIG" ] || { echo "(no config)"; return; }
+  local cb; cb="$(cur_baseurl)"
+  for p in $(list_profiles); do
+    [ "$(meta_get base_url "$PROF_DIR/$p/meta")" = "$cb" ] && { echo "$p"; return; }
+  done
+  echo "(unknown: ${cb:-none})"
+}
+
+usage() {
+  cat <<EOF
+agent-switch — switch Codex and Claude Code between API relays
+
+Usage: agent-switch <agent> <command> [args]
+
+Commands:
+  codex init | add <name> | rm <name>
+  codex use <name> | model [<name>]
+  codex list | current
+  cc init | add | rm | use | model | list | current
+  cc doctor | restore
+
+Options (for switch):
+  --no-db              do not rewrite session models in the state DB
+
+Claude Code profile creation:
+  cc add <name> --from-codex --model <claude-model>
+  cc add <name> --env-file <json>
+
+Reload the relevant VS Code window after switching if an already-open agent
+process does not observe the updated settings.
+EOF
+}
+
+# --- write a valid JSON auth.json (python3 if available, else printf fallback) ---
+write_auth() {
+  local path="$1" key="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    KEY_VALUE="$key" python3 - "$path" <<'PY'
+import json, os, sys
+json.dump({"auth_mode": "apikey", "OPENAI_API_KEY": os.environ["KEY_VALUE"]},
+          open(sys.argv[1], "w"), indent=2)
+PY
+  else
+    # Fallback: keys here are OpenAI-style tokens (no quotes/backslashes), safe to inline.
+    printf '{\n  "auth_mode": "apikey",\n  "OPENAI_API_KEY": "%s"\n}\n' "$key" > "$path"
+  fi
+  chmod 600 "$path"
+}
+
+auth_key_ok() {
+  # true if auth.json parses and key is non-empty and not a placeholder
+  local path="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$path" <<'PY' 2>/dev/null
+import json, sys
+try:
+    k = str(json.load(open(sys.argv[1])).get("OPENAI_API_KEY", ""))
+except Exception:
+    sys.exit(1)
+sys.exit(1 if (not k or "PUT_YOUR" in k) else 0)
+PY
+  else
+    grep -q '"OPENAI_API_KEY"' "$path" 2>/dev/null && ! grep -q 'PUT_YOUR' "$path" 2>/dev/null
+  fi
+}
+
+do_init() {
+  mkdir -p "$PROF_DIR"
+  if [ ! -f "$CONFIG" ]; then
+    cat > "$CONFIG" <<EOF
+model = "gpt-5-codex"
+model_provider = "$PKEY"
+model_reasoning_effort = "high"
+
+[model_providers.$PKEY]
+name = "$PKEY"
+base_url = "https://api.openai.com/v1"
+wire_api = "$DEFAULT_WIRE_API"
+EOF
+    note "created $CONFIG with the single [model_providers.$PKEY] block"
+  elif ! grep -q "^\[model_providers\.$PKEY\]" "$CONFIG"; then
+    cp -a "$CONFIG" "$CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+    cat >> "$CONFIG" <<EOF
+
+[model_providers.$PKEY]
+name = "$PKEY"
+base_url = "https://api.openai.com/v1"
+wire_api = "$DEFAULT_WIRE_API"
+EOF
+    note "appended [model_providers.$PKEY] block to $CONFIG (backup saved)"
+    note "note: set top-level model_provider = \"$PKEY\" in $CONFIG if not already"
+  else
+    note "config already has [model_providers.$PKEY]; nothing to do"
+  fi
+  note "next: agent-switch codex add <name>"
+}
+
+do_add() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agent-switch codex add <name>"
+  case "$name" in .*|*/*) die "invalid profile name: $name";; esac
+  local dir="$PROF_DIR/$name"
+  mkdir -p "$dir"
+
+  local base_url model wire_api key
+  printf 'base_url (e.g. https://relay.example.com/v1): ' >&2; read -r base_url
+  [ -n "$base_url" ] || die "base_url is required"
+  printf 'model name (e.g. gpt-5-codex): ' >&2; read -r model
+  [ -n "$model" ] || die "model is required"
+  printf 'wire_api [%s]: ' "$DEFAULT_WIRE_API" >&2; read -r wire_api
+  wire_api="${wire_api:-$DEFAULT_WIRE_API}"
+  printf 'API key (input hidden): ' >&2; read -rs key; printf '\n' >&2
+  [ -n "$key" ] || die "API key is required"
+
+  printf 'model=%s\nbase_url=%s\nwire_api=%s\n' "$model" "$base_url" "$wire_api" > "$dir/meta"
+  write_auth "$dir/auth.json" "$key"
+  key=""
+  note "added profile '$name' (model=$model, wire_api=$wire_api)"
+  note "switch to it with: agent-switch codex use $name"
+}
+
+do_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agent-switch codex rm <name>"
+  local dir="$PROF_DIR/$name"
+  [ -d "$dir" ] || die "no such profile: $name"
+  rm -rf "$dir"
+  note "removed profile '$name'"
+}
+
+do_list() {
+  local cur; cur="$(current)"
+  local any=0
+  for p in $(list_profiles); do
+    any=1
+    local m; m="$(meta_get model "$PROF_DIR/$p/meta")"
+    if [ "$p" = "$cur" ]; then printf '* %-10s (current)  model=%s\n' "$p" "$m"
+    else printf '  %-10s           model=%s\n' "$p" "$m"; fi
+  done
+  [ "$any" = 1 ] || note "no profiles yet — add one with: agent-switch codex add <name>"
+}
+
+prune_backups() {
+  local backup="$1" pat="$2"
+  ls -1t "$backup/$pat".* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) \
+    | while read -r f; do rm -f "$f"; done \
+    || true
+}
+
+# rewrite threads.model in the newest state DB to $1. echoes a human note.
+# respects REWRITE_DB and $backup/$ts from the caller's scope.
+rewrite_session_models() {
+  local model="$1" esc STATE_DB db_note=""
+  esc="${model//\'/\'\'}"
+  STATE_DB="$(find_state_db)"
+  if [ "$REWRITE_DB" = 1 ] && [ -n "$STATE_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    cp -a "$STATE_DB" "$backup/$(basename "$STATE_DB").$ts" 2>/dev/null || true
+    if sqlite3 "$STATE_DB" \
+        "PRAGMA busy_timeout=10000; UPDATE threads SET model='$esc' WHERE model IS NOT NULL AND model<>'$esc';" \
+        >/dev/null 2>&1; then
+      local n; n="$(sqlite3 "$STATE_DB" "SELECT count(*) FROM threads WHERE model='$esc';" 2>/dev/null)"
+      db_note="  unified session model to $model (${n:-?} sessions)"
+    else
+      db_note="  warning: could not update session models (state DB busy); old sessions may error on resume"
+    fi
+    prune_backups "$backup" "$(basename "$STATE_DB")"
+  fi
+  [ -n "$db_note" ] && echo "$db_note"
+}
+
+do_switch() {
+  local name="$1"
+  local src="$PROF_DIR/$name"
+  [ -f "$CONFIG" ] || die "no $CONFIG — run: agent-switch codex init"
+  [ -d "$src" ] || die "unknown profile '$name'. available: $(list_profiles | paste -sd', ' -)"
+  [ -f "$src/meta" ] || die "$src/meta missing"
+  [ -f "$src/auth.json" ] || die "$src/auth.json missing"
+
+  local model base_url wire_api
+  model="$(meta_get model "$src/meta")"
+  base_url="$(meta_get base_url "$src/meta")"
+  wire_api="$(meta_get wire_api "$src/meta")"; wire_api="${wire_api:-$DEFAULT_WIRE_API}"
+  [ -n "$model" ] && [ -n "$base_url" ] || die "$src/meta incomplete (need model= and base_url=)"
+
+  grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
+    || die "$CONFIG has no [model_providers.$PKEY] block — run: agent-switch codex init"
+  auth_key_ok "$src/auth.json" \
+    || die "profile '$name' has a placeholder/invalid API key — re-run: agent-switch codex add $name"
+
+  # backup current state
+  local ts backup; ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$PROF_DIR/.last-backup"; mkdir -p "$backup"
+  cp -a "$CONFIG" "$backup/config.toml.$ts"
+  [ -f "$AUTH" ] && cp -a "$AUTH" "$backup/auth.json.$ts"
+
+  # atomic replace auth.json
+  install -m 600 "$src/auth.json" "$AUTH.tmp.$$"
+  mv -f "$AUTH.tmp.$$" "$AUTH"
+
+  # top-level model
+  set_config_model "$model"
+
+  # base_url + wire_api inside the [model_providers.codex] block only
+  local tmp; tmp="$(mktemp)"
+  awk -v url="$base_url" -v wire="$wire_api" '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1; print; next}
+    /^\[/{inblk=0}
+    inblk && /^base_url/{print "base_url = \"" url "\""; next}
+    inblk && /^wire_api/{print "wire_api = \"" wire "\""; next}
+    {print}
+  ' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"; rm -f "$tmp"
+
+  # rewrite session models so the plugin can resume old sessions on this relay
+  local db_note; db_note="$(rewrite_session_models "$model")"
+
+  prune_backups "$backup" "config.toml"
+  prune_backups "$backup" "auth.json"
+
+  echo "switched to '$name'  (model=$model)"
+  echo "  base_url=$base_url  wire_api=$wire_api  provider=$PKEY"
+  [ -n "$db_note" ] && echo "$db_note"
+  echo "tip: reload the VSCode window for the Codex plugin to pick this up."
+}
+
+do_model() {
+  local want="${1:-}"
+  [ -f "$CONFIG" ] || die "no $CONFIG — run: agent-switch codex init"
+  grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
+    || die "$CONFIG has no [model_providers.$PKEY] block — run: agent-switch codex init"
+
+  local models fetch_rc=0
+  models="$(fetch_models)" || fetch_rc=$?
+
+  if [ -z "$want" ]; then
+    [ "$fetch_rc" = 0 ] || die "could not list models (see message above)"
+    local cm; cm="$(cur_model)"
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      if [ "$m" = "$cm" ]; then printf '* %s\n' "$m"; else printf '  %s\n' "$m"; fi
+    done <<< "$models"
+    return 0
+  fi
+
+  if [ "$fetch_rc" = 0 ] && [ -n "$models" ]; then
+    if ! grep -qxF "$want" <<< "$models"; then
+      note "error: model '$want' not found on $(cur_baseurl). available:"
+      while IFS= read -r m; do [ -n "$m" ] && printf '  %s\n' "$m" >&2; done <<< "$models"
+      exit 1
+    fi
+  else
+    note "warning: could not verify models on $(cur_baseurl); setting '$want' anyway"
+  fi
+
+  local ts backup; ts="$(date +%Y%m%d-%H%M%S)"
+  backup="$PROF_DIR/.last-backup"; mkdir -p "$backup"
+  cp -a "$CONFIG" "$backup/config.toml.$ts"
+
+  set_config_model "$want"
+
+  local prof; prof="$(current)"
+  if [ -d "$PROF_DIR/$prof" ] && [ -f "$PROF_DIR/$prof/meta" ]; then
+    local tmp; tmp="$(mktemp)"
+    CX_SET_MODEL="$want" awk -F= '/^model=/{print "model=" ENVIRON["CX_SET_MODEL"]; next} {print}' "$PROF_DIR/$prof/meta" > "$tmp"
+    grep -q '^model=' "$PROF_DIR/$prof/meta" || printf 'model=%s\n' "$want" >> "$tmp"
+    cat "$tmp" > "$PROF_DIR/$prof/meta"; rm -f "$tmp"
+  else
+    note "note: current relay matches no profile; model not persisted to any profile meta"
+  fi
+
+  local db_note; db_note="$(rewrite_session_models "$want")"
+  prune_backups "$backup" "config.toml"
+
+  echo "model set to '$want'  (relay=$prof)"
+  [ -n "$db_note" ] && echo "$db_note"
+  echo "tip: reload the VSCode window for the Codex plugin to pick this up."
+}
+
+# ----- Claude Code profiles -----
+
+cc_profile_names() {
+  [ -d "$CC_PROF_DIR" ] || return 0
+  for f in "$CC_PROF_DIR"/*/env.json; do
+    [ -f "$f" ] || continue
+    basename "$(dirname "$f")"
+  done
+}
+
+cc_require_python() {
+  command -v python3 >/dev/null 2>&1 || die "Claude Code switching requires python3 (stdlib JSON support)"
+}
+
+cc_init() {
+  mkdir -p "$CC_PROF_DIR" "$CC_BACKUP"
+  note "Claude Code profiles: $CC_PROF_DIR"
+  note "settings: $CC_SETTINGS"
+}
+
+cc_validate_name() {
+  case "$1" in
+    ''|.*|*/*|*[!A-Za-z0-9_.-]*) die "invalid Claude profile name: $1" ;;
+  esac
+}
+
+cc_add() {
+  cc_require_python
+  local name="${1:-}" env_file="" from_codex=0 model="" arg
+  [ -n "$name" ] || die "usage: agent-switch cc add <name> --env-file FILE|--from-codex [--model MODEL]"
+  cc_validate_name "$name"
+  shift
+  while [ "$#" -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --env-file) [ "$#" -gt 0 ] || die "--env-file requires a path"; env_file="$1"; shift ;;
+      --from-codex) from_codex=1 ;;
+      --model) [ "$#" -gt 0 ] || die "--model requires a value"; model="$1"; shift ;;
+      *) die "unknown cc add option: $arg" ;;
+    esac
+  done
+  [ -n "$env_file" ] || [ "$from_codex" = 1 ] || die "choose --env-file or --from-codex"
+  [ -z "$env_file" ] || [ "$from_codex" = 0 ] || die "choose only one of --env-file and --from-codex"
+
+  mkdir -p "$CC_PROF_DIR/$name"
+  if [ "$from_codex" = 1 ]; then
+    local src="$PROF_DIR/$name"
+    [ -f "$src/meta" ] && [ -f "$src/auth.json" ] || die "Codex profile '$name' not found"
+    [ -n "$model" ] || die "--model is required with --from-codex (Claude model IDs differ from Codex)"
+    CC_SRC_META="$src/meta" CC_SRC_AUTH="$src/auth.json" CC_OUT="$CC_PROF_DIR/$name/env.json" CC_MODEL="$model" python3 - <<'PY'
+import json, os, pathlib
+meta = {}
+for line in pathlib.Path(os.environ['CC_SRC_META']).read_text().splitlines():
+    if '=' in line:
+        k, v = line.split('=', 1)
+        meta[k] = v
+auth = json.loads(pathlib.Path(os.environ['CC_SRC_AUTH']).read_text())
+base = meta.get('base_url', '').rstrip('/')
+if base.endswith('/v1'):
+    base = base[:-3]
+key = auth.get('OPENAI_API_KEY', '')
+if not base or not key:
+    raise SystemExit('Codex profile is missing base_url or API key')
+model = os.environ['CC_MODEL']
+env = {
+    'ANTHROPIC_BASE_URL': base,
+    'ANTHROPIC_AUTH_TOKEN': str(key),
+    'ANTHROPIC_MODEL': model,
+    'ANTHROPIC_DEFAULT_OPUS_MODEL': model,
+    'ANTHROPIC_DEFAULT_SONNET_MODEL': model,
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL': model,
+}
+out = pathlib.Path(os.environ['CC_OUT'])
+out.write_text(json.dumps({'env': env}, ensure_ascii=False, indent=2) + '\n')
+os.chmod(out, 0o600)
+PY
+  else
+    [ -f "$env_file" ] || die "env file not found: $env_file"
+    CC_SRC="$env_file" CC_OUT="$CC_PROF_DIR/$name/env.json" python3 - <<'PY'
+import json, os, pathlib
+src = pathlib.Path(os.environ['CC_SRC'])
+data = json.loads(src.read_text())
+env = data.get('env', data)
+if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
+    raise SystemExit('env file must be a JSON object or {"env": {string: string}}')
+if any(not k or '=' in k or '\x00' in k or '\n' in k for k in env):
+    raise SystemExit('invalid environment variable name')
+out = pathlib.Path(os.environ['CC_OUT'])
+out.write_text(json.dumps({'env': env}, ensure_ascii=False, indent=2) + '\n')
+os.chmod(out, 0o600)
+PY
+  fi
+  note "added Claude profile '$name'"
+}
+
+cc_backup_settings() {
+  mkdir -p "$CC_BACKUP"
+  local ts="$1"
+  [ -f "$CC_SETTINGS" ] && cp -a "$CC_SETTINGS" "$CC_BACKUP/settings.json.$ts"
+  [ -f "$CC_ACTIVE" ] && cp -a "$CC_ACTIVE" "$CC_BACKUP/active.$ts"
+  [ -f "$CC_MANAGED" ] && cp -a "$CC_MANAGED" "$CC_BACKUP/managed-keys.$ts"
+  ls -1t "$CC_BACKUP"/settings.json.* 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) | xargs -r rm -f
+}
+
+cc_use() {
+  cc_require_python
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agent-switch cc use <name>"
+  local profile="$CC_PROF_DIR/$name/env.json"
+  [ -f "$profile" ] || die "unknown Claude profile '$name'. available: $(cc_profile_names | paste -sd', ' -)"
+  mkdir -p "$CC_PROF_DIR" "$CC_BACKUP" "$CLAUDE_HOME"
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  cc_backup_settings "$ts"
+  CC_PROFILE="$profile" CC_SETTINGS_PATH="$CC_SETTINGS" CC_ACTIVE_PATH="$CC_ACTIVE" CC_MANAGED_PATH="$CC_MANAGED" python3 - <<'PY'
+import json, os, pathlib, tempfile
+
+profile = pathlib.Path(os.environ['CC_PROFILE'])
+settings_path = pathlib.Path(os.environ['CC_SETTINGS_PATH'])
+active_path = pathlib.Path(os.environ['CC_ACTIVE_PATH'])
+managed_path = pathlib.Path(os.environ['CC_MANAGED_PATH'])
+
+data = json.loads(profile.read_text())
+env = data.get('env', data)
+if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
+    raise SystemExit('profile env.json must contain string environment values')
+
+if settings_path.exists():
+    settings = json.loads(settings_path.read_text())
+else:
+    settings = {}
+if not isinstance(settings, dict):
+    raise SystemExit('Claude settings.json must contain a JSON object')
+current_env = settings.get('env', {})
+if not isinstance(current_env, dict):
+    raise SystemExit('Claude settings.json env must be an object')
+
+if managed_path.exists():
+    old_keys = {x.strip() for x in managed_path.read_text().splitlines() if x.strip()}
+else:
+    prefixes = ('ANTHROPIC_', 'AWS_', 'GOOGLE_', 'VERTEX_')
+    old_keys = {k for k in current_env if k.startswith(prefixes)}
+
+for key in old_keys:
+    current_env.pop(key, None)
+current_env.update(env)
+settings['env'] = current_env
+
+def atomic_write(path, text, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f'.{path.name}.', dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+mode = 0o600
+if settings_path.exists():
+    mode = settings_path.stat().st_mode & 0o777
+atomic_write(settings_path, json.dumps(settings, ensure_ascii=False, indent=2) + '\n', mode)
+atomic_write(active_path, os.path.basename(os.path.dirname(profile)) + '\n')
+atomic_write(managed_path, '\n'.join(sorted(env)) + '\n')
+PY
+  echo "switched Claude Code to '$name'"
+  cc_show_env "$name"
+  echo "IMPORTANT: reload the VS Code window after switching; an already-open Claude process may cache the previous endpoint/model."
+  echo "  new CLI sessions and resumed CLI sessions read the updated settings; an in-flight request cannot move providers."
+}
+
+cc_show_env() {
+  local profile="$CC_PROF_DIR/${1:-}/env.json"
+  [ -f "$profile" ] || return 0
+  python3 - "$profile" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+e = d.get('env', d)
+for k in ('ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'):
+    if e.get(k):
+        print(f'  {k}={e[k]}')
+for k in ('ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'):
+    if e.get(k):
+        print(f'  {k}=<set>')
+PY
+}
+
+cc_list() {
+  local active=""
+  [ -f "$CC_ACTIVE" ] && active="$(tr -d '\n' < "$CC_ACTIVE")"
+  local p any=0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    any=1
+    if [ "$p" = "$active" ]; then
+      printf '* %s (current)\n' "$p"
+    else
+      printf '  %s\n' "$p"
+    fi
+  done < <(cc_profile_names)
+  [ "$any" = 1 ] || note "no Claude profiles — add one with: agent-switch cc add <name> --from-codex --model <claude-model>"
+}
+
+cc_current() {
+  [ -f "$CC_ACTIVE" ] || { echo "(none)"; return; }
+  local p; p="$(tr -d '\n' < "$CC_ACTIVE")"
+  echo "$p"
+  cc_show_env "$p"
+}
+
+cc_model() {
+  cc_require_python
+  local want="${1:-}" name=""
+  [ -f "$CC_ACTIVE" ] && name="$(tr -d '\n' < "$CC_ACTIVE")"
+  [ -n "$name" ] || die "no active Claude profile"
+  local profile="$CC_PROF_DIR/$name/env.json"
+  [ -f "$profile" ] || die "active profile is missing: $name"
+  if [ -z "$want" ]; then
+    python3 - "$profile" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1])).get('env', {})
+print(e.get('ANTHROPIC_MODEL', '(unset)'))
+PY
+    return
+  fi
+  CC_PROFILE="$profile" CC_MODEL="$want" python3 - <<'PY'
+import json, os, pathlib, tempfile
+p = pathlib.Path(os.environ['CC_PROFILE'])
+d = json.loads(p.read_text())
+d.setdefault('env', {})['ANTHROPIC_MODEL'] = os.environ['CC_MODEL']
+fd, tmp = tempfile.mkstemp(prefix=f'.{p.name}.', dir=str(p.parent))
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(json.dumps(d, ensure_ascii=False, indent=2) + '\n')
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, p)
+finally:
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+PY
+  cc_use "$name"
+}
+
+cc_doctor() {
+  cc_require_python
+  if [ -f "$CC_SETTINGS" ]; then
+    python3 -m json.tool "$CC_SETTINGS" >/dev/null || note "warning: invalid $CC_SETTINGS"
+    stat -c 'settings mode=%a path=%n' "$CC_SETTINGS" 2>/dev/null || true
+  else
+    note "warning: missing $CC_SETTINGS"
+  fi
+  local name=""
+  [ -f "$CC_ACTIVE" ] && name="$(tr -d '\n' < "$CC_ACTIVE")"
+  [ -n "$name" ] && [ -f "$CC_PROF_DIR/$name/env.json" ] || note "warning: no active Claude profile"
+  for k in ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL; do
+    [ -n "${!k:-}" ] && note "warning: shell exports $k; verify its precedence over settings.json"
+  done
+  [ -n "$name" ] && { echo "active: $name"; cc_show_env "$name"; }
+}
+
+cc_restore() {
+  local latest; latest="$(ls -1t "$CC_BACKUP"/settings.json.* 2>/dev/null | head -1)"
+  [ -n "$latest" ] || die "no Claude settings backup found"
+  local ts="${latest##*.}"
+  cp -a "$latest" "$CC_SETTINGS"
+  if [ -f "$CC_BACKUP/active.$ts" ]; then cp -a "$CC_BACKUP/active.$ts" "$CC_ACTIVE"; else rm -f "$CC_ACTIVE"; fi
+  if [ -f "$CC_BACKUP/managed-keys.$ts" ]; then cp -a "$CC_BACKUP/managed-keys.$ts" "$CC_MANAGED"; else rm -f "$CC_MANAGED"; fi
+  note "restored $latest to $CC_SETTINGS; reload the VS Code window before continuing"
+}
+
+do_cc() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    init) cc_init ;;
+    add) cc_add "$@" ;;
+    use|switch) cc_use "$@" ;;
+    rm|remove) [ "$#" = 1 ] || die "usage: agent-switch cc rm <name>"; cc_validate_name "$1"; rm -rf "$CC_PROF_DIR/$1"; note "removed Claude profile '$1'" ;;
+    list|ls) cc_list ;;
+    current|cur) cc_current ;;
+    model) cc_model "$@" ;;
+    doctor) cc_doctor ;;
+    restore) cc_restore ;;
+    help|-h|--help) usage ;;
+    *) cc_use "$sub" "$@" ;;
+  esac
+}
+
+do_codex() {
+  local sub="${1:-list}"
+  shift || true
+  case "$sub" in
+    init) do_init ;;
+    add) do_add "$@" ;;
+    rm|remove) do_rm "$@" ;;
+    use|switch) [ "$#" -ge 1 ] || die "usage: agent-switch codex use <name>"; do_switch "$@" ;;
+    model) do_model "$@" ;;
+    list|ls) do_list ;;
+    current|cur) echo "current: $(current)" ;;
+    help|-h|--help) usage ;;
+    *) do_switch "$sub" "$@" ;;
+  esac
+}
+
+# ---- arg parsing: pull out --no-db anywhere ----
+args=()
+for a in "$@"; do
+  case "$a" in
+    --no-db) REWRITE_DB=0 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+
+cmd="${1:-list}"
+case "$cmd" in
+  cc)             shift; do_cc "$@" ;;
+  codex)          shift; do_codex "$@" ;;
+  help|-h|--help) usage ;;
+  *)              usage; exit 2 ;;
+esac

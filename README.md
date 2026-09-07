@@ -1,15 +1,15 @@
-# codex-switch
+# agent-switch
 
 Switch the [OpenAI Codex](https://github.com/openai/codex) CLI **and** the VSCode
 Codex plugin between multiple API relays (中转站) with one command — without losing
 your session history across relays.
 
 ```
-$ codex-switch list
+$ agent-switch codex list
 * n1n        (current)  model=gpt-5-codex
   dmx                   model=gpt-5-codex-cdx
 
-$ codex-switch dmx
+$ agent-switch codex use dmx
 switched to 'dmx'  (model=gpt-5-codex-cdx)
   base_url=https://relay-b.example.com/v1  wire_api=responses  provider=codex
   unified session model to gpt-5-codex-cdx (66 sessions)
@@ -64,8 +64,8 @@ relay's model, so any session resumes cleanly on the current relay. Disable with
 ## Install
 
 ```bash
-git clone <this-repo> codex-switch
-cd codex-switch
+git clone <this-repo> agent-switch
+cd agent-switch
 ./install.sh          # copies to ~/.local/bin, ensures PATH
 ```
 
@@ -78,16 +78,30 @@ Requirements:
 
 ## Usage
 
+The executable is `agent-switch`; every operation is namespaced by agent:
+`agent-switch codex <command>` or `agent-switch cc <command>`. The old
+`codex-switch` name remains a compatibility shim for existing scripts.
+
 ```bash
-codex-switch init              # set up config.toml with the single provider block
-codex-switch add n1n           # add a relay (prompts for base_url / model / key)
-codex-switch add dmx
-codex-switch list              # list profiles, mark current
-codex-switch dmx               # switch to relay 'dmx'
-codex-switch current           # show current relay
-codex-switch model             # list models the current relay offers
-codex-switch model gpt-5-codex # switch active model (validated against the relay)
-codex-switch rm dmx            # remove a profile
+agent-switch codex init              # set up config.toml with the single provider block
+agent-switch codex add n1n           # add a relay (prompts for base_url / model / key)
+agent-switch codex add dmx
+agent-switch codex list              # list profiles, mark current
+agent-switch codex use dmx            # switch to relay 'dmx'
+agent-switch codex current            # show current relay
+agent-switch codex model              # list models the current relay offers
+agent-switch codex model gpt-5-codex  # switch active model (validated against the relay)
+agent-switch codex rm dmx             # remove a profile
+
+# Claude Code (CLI + anthropic.claude-code VS Code extension)
+agent-switch cc init
+agent-switch cc add n1n --from-codex --model claude-opus-4-8
+agent-switch cc add dmx --from-codex --model claude-opus-4-8-cc
+agent-switch cc list
+agent-switch cc use dmx
+agent-switch cc model claude-sonnet-5
+agent-switch cc doctor
+agent-switch cc rm old-profile
 ```
 
 `add` prompts for:
@@ -102,8 +116,8 @@ codex-switch rm dmx            # remove a profile
 
 ### Switching models on a relay
 
-`codex-switch model` lists the models the **current relay** actually serves (live
-`/v1/models` fetch), marking the active one with `*`. `codex-switch model <name>`
+`agent-switch codex model` lists the models the **current relay** actually serves (live
+`/v1/models` fetch), marking the active one with `*`. `agent-switch codex model <name>`
 validates `<name>` against that list (refusing, with the available list, if it's
 not there — so you can't accidentally pin a model the relay lacks), then updates
 the top-level `model` in `config.toml`, writes the choice back to the current
@@ -115,6 +129,33 @@ Requires `curl`. Reload the VSCode window afterward.
 
 Run **Developer: Reload Window** so the Codex plugin (which runs a persistent
 `codex app-server`) re-reads `config.toml` and `auth.json`.
+
+### Claude Code profiles
+
+`cc` manages Claude Code's shared `~/.claude/settings.json`, which is read by
+both the `claude` CLI and the `anthropic.claude-code` VS Code extension. Profiles
+are stored under `~/.claude/provider-profiles/` and contain an `env.json` with
+Anthropic-compatible environment variables. `--from-codex` imports the existing
+Codex profile's endpoint and key; pass a Claude model explicitly because model
+names are not shared between the two clients.
+
+```bash
+agent-switch cc add n1n --from-codex --model claude-opus-4-8
+agent-switch cc add dmx --from-codex --model claude-opus-4-8-cc
+agent-switch cc use n1n
+agent-switch cc use dmx
+```
+
+The switch is an atomic JSON update. It preserves unrelated settings, keeps
+tokens at mode `600`, and never prints secret values. New CLI sessions and
+resumed sessions use the new provider on their next request. An in-flight
+request cannot move providers; if a VS Code build keeps an already-open session
+on its old process, reopen that session or reload the window.
+
+Claude history under `~/.claude/projects/**/*.jsonl` is intentionally not
+rewritten. Historical messages keep their original model metadata; only future
+requests use the selected profile. `cc doctor` checks JSON validity, permissions,
+active profile state, and warns about shell-level `ANTHROPIC_*` overrides.
 
 ---
 
@@ -175,10 +216,10 @@ The plugin's model menu only lists its built-in whitelist of official names. Rel
 often use their own names (suffixes like `-cdx`, `-high`), which aren't on that
 whitelist, so the plugin labels them "Custom" — this is cosmetic and doesn't affect
 function. To see and switch among the names a relay actually accepts, use
-`codex-switch model` / `codex-switch model <name>` instead of the plugin menu.
+`agent-switch codex model` / `agent-switch codex model <name>` instead of the plugin menu.
 
 **The VSCode plugin gives `401 Unauthorized: 未提供令牌 / Invalid token` on a relay, but the CLI works fine on the same relay.**
-This is almost certainly **not** a codex-switch problem — it's the codex binary
+This is almost certainly **not** an agent-switch problem — it's the codex binary
 version. The CLI on your `PATH` and the codex binary **bundled inside the VSCode
 `openai.chatgpt` extension** are often different builds, and some prebuilt/alpha
 builds fail to attach the `Authorization` header when using apikey auth against a
