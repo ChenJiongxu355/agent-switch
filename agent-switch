@@ -11,6 +11,11 @@
 #   3. Sessions store their model: state_*.sqlite's threads.model pins the model
 #      per session; resuming an old session on a relay that lacks that model → 503.
 #      Fix: on switch, rewrite threads.model to the target relay's model.
+#   4. requires_openai_auth: up to codex 0.148 the auth.json API key was sent to any
+#      provider. From ~0.154 a provider without env_key and without
+#      requires_openai_auth gets NO Authorization header at all → the relay answers
+#      401 "Invalid token". Fix: the provider block carries requires_openai_auth =
+#      true, which keeps auth.json as the key source (so fix #1 still holds).
 #
 # The Codex backend touches: config.toml (top model + [model_providers.codex] base_url),
 # auth.json, and threads.model in the state DB. It never touches session bodies,
@@ -71,6 +76,27 @@ cur_baseurl() {
 # top-level model currently set in config.toml
 cur_model() {
   awk '/^model *=/{gsub(/^model *= *"?|"? *$/,"");print;exit}' "$CONFIG" 2>/dev/null || true
+}
+
+# codex >= ~0.154 only attaches the auth.json API key when the provider block asks
+# for it (see reason #4). Add the line to an existing block if it is missing.
+ensure_openai_auth_flag() {
+  awk '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1}
+    inblk && /^requires_openai_auth/{found=1}
+    /^\[/ && !/^\[model_providers\.'"$PKEY"'\]/{inblk=0}
+    END{exit found?0:1}
+  ' "$CONFIG" && return 0
+  local tmp; tmp="$(mktemp)"
+  awk '
+    /^\[model_providers\.'"$PKEY"'\]/{inblk=1; print; next}
+    /^\[/{if(inblk && !done){print "requires_openai_auth = true"; done=1} inblk=0}
+    inblk && /^base_url/{print; print "requires_openai_auth = true"; done=1; next}
+    {print}
+    END{if(inblk && !done) print "requires_openai_auth = true"}
+  ' "$CONFIG" > "$tmp"
+  cat "$tmp" > "$CONFIG"; rm -f "$tmp"
+  note "added requires_openai_auth = true to [model_providers.$PKEY] (codex >= 0.154 needs it)"
 }
 
 # safely set the top-level model line in config.toml (avoids sed/awk metachar injection)
@@ -188,6 +214,7 @@ model_reasoning_effort = "high"
 [model_providers.$PKEY]
 name = "$PKEY"
 base_url = "https://api.openai.com/v1"
+requires_openai_auth = true
 wire_api = "$DEFAULT_WIRE_API"
 EOF
     note "created $CONFIG with the single [model_providers.$PKEY] block"
@@ -198,12 +225,14 @@ EOF
 [model_providers.$PKEY]
 name = "$PKEY"
 base_url = "https://api.openai.com/v1"
+requires_openai_auth = true
 wire_api = "$DEFAULT_WIRE_API"
 EOF
     note "appended [model_providers.$PKEY] block to $CONFIG (backup saved)"
     note "note: set top-level model_provider = \"$PKEY\" in $CONFIG if not already"
   else
-    note "config already has [model_providers.$PKEY]; nothing to do"
+    ensure_openai_auth_flag
+    note "config already has [model_providers.$PKEY]; nothing else to do"
   fi
   note "next: agent-switch codex add <name>"
 }
@@ -297,6 +326,7 @@ do_switch() {
 
   grep -q "^\[model_providers\.$PKEY\]" "$CONFIG" \
     || die "$CONFIG has no [model_providers.$PKEY] block — run: agent-switch codex init"
+  ensure_openai_auth_flag
   auth_key_ok "$src/auth.json" \
     || die "profile '$name' has a placeholder/invalid API key — re-run: agent-switch codex add $name"
 

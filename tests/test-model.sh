@@ -62,4 +62,18 @@ n="$(sqlite3 "$T/state_5.sqlite" "SELECT count(*) FROM threads;" 2>/dev/null)"
 [ "$(sqlite3 "$T/state_5.sqlite" "SELECT DISTINCT model FROM threads;" 2>/dev/null)" = "$mal" ] && pass "injection: model set literally" || fail "injection: model set literally"
 teardown
 
+# 7. requires_openai_auth is added to a legacy provider block and stays idempotent
+setup
+grep -v '^requires_openai_auth' "$T/config.toml" > "$T/c2" && mv "$T/c2" "$T/config.toml"
+export CX_MODELS_STUB=$'gpt-a\ngpt-b'
+"$SW" codex use p1 >/dev/null 2>&1
+[ "$(grep -c '^requires_openai_auth = true' "$T/config.toml")" = 1 ] \
+  && pass "switch adds requires_openai_auth" || fail "switch adds requires_openai_auth"
+"$SW" codex use p1 >/dev/null 2>&1
+[ "$(grep -c '^requires_openai_auth = true' "$T/config.toml")" = 1 ] \
+  && pass "requires_openai_auth is idempotent" || fail "requires_openai_auth is idempotent"
+python3 -c "import sys,tomllib; tomllib.load(open(sys.argv[1],'rb'))" "$T/config.toml" \
+  && pass "config still parses as TOML" || fail "config still parses as TOML"
+teardown
+
 [ "$FAIL" = 0 ] && echo "ALL TESTS PASSED" || { echo "SOME TESTS FAILED"; exit 1; }
